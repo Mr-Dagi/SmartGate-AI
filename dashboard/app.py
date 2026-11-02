@@ -23,7 +23,12 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QMessageBox,
     QAbstractItemView,
-    QPlainTextEdit
+    QPlainTextEdit,
+    QDialog,
+    QFormLayout,
+    QSpinBox,
+    QInputDialog,
+    QDialogButtonBox
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -38,6 +43,10 @@ from database.db import (
     get_all_students,
     search_students,
     get_student_by_card,
+    get_card_by_student,
+    create_student,
+    assign_card,
+    remove_card,
     log_verification
 )
 
@@ -717,18 +726,34 @@ class SmartGateWindow(QMainWindow):
             "Full Name",
             "Department",
             "Year",
-            "Enrollment"
+            "Enrollment",
+            "NFC Card"
         ])
 
         panel_layout.addWidget(self.students_table)
 
         layout.addWidget(panel, 1)
 
+        actions = QHBoxLayout()
+
+        register_button = QPushButton("REGISTER STUDENT")
+        register_button.setObjectName("primary")
+        register_button.clicked.connect(self.register_student_dialog)
+
+        assign_button = QPushButton("ASSIGN NFC CARD")
+        assign_button.clicked.connect(self.assign_nfc_card_dialog)
+
+        remove_button = QPushButton("REMOVE NFC CARD")
+        remove_button.clicked.connect(self.remove_nfc_card_dialog)
+
         refresh_button = QPushButton("REFRESH STUDENTS")
-        refresh_button.setObjectName("primary")
         refresh_button.clicked.connect(self.refresh_students)
 
-        layout.addWidget(refresh_button)
+        actions.addWidget(register_button)
+        actions.addWidget(assign_button)
+        actions.addWidget(remove_button)
+        actions.addWidget(refresh_button)
+        layout.addLayout(actions)
 
         return page
 
@@ -1033,7 +1058,8 @@ class SmartGateWindow(QMainWindow):
                     student["full_name"],
                     student["department"],
                     student["year_level"],
-                    student["enrollment_status"]
+                    student["enrollment_status"],
+                    student["nfc_id"] or "Not assigned"
                 )
                 for student in students
             ]
@@ -1050,6 +1076,170 @@ class SmartGateWindow(QMainWindow):
                 str(error)
             )
 
+    def register_student_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Register Student")
+        dialog.setMinimumWidth(430)
+
+        form = QFormLayout(dialog)
+        full_name = QLineEdit()
+        department = QLineEdit()
+        year_level = QSpinBox()
+        year_level.setRange(1, 10)
+        year_level.setValue(1)
+        university = QLineEdit("Unity University")
+        card_uid = QLineEdit()
+        card_uid.setPlaceholderText("Optional: card UID")
+
+        form.addRow("Full name", full_name)
+        form.addRow("Department", department)
+        form.addRow("Year level", year_level)
+        form.addRow("University", university)
+        form.addRow("NFC card UID (optional)", card_uid)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        name_value = full_name.text().strip()
+        department_value = department.text().strip()
+        university_value = university.text().strip() or "Unity University"
+
+        if not name_value or not department_value:
+            QMessageBox.warning(
+                self,
+                "Missing Information",
+                "Enter the student's full name and department."
+            )
+            return
+
+        student_id = create_student(
+            name_value,
+            department_value,
+            year_level.value(),
+            card_uid.text().strip() or None,
+            university_value
+        )
+
+        if not student_id:
+            QMessageBox.warning(
+                self,
+                "Registration Failed",
+                "The student could not be registered. Check whether the student or NFC card already exists."
+            )
+            return
+
+        self.refresh_students()
+        self.refresh_dashboard()
+        QMessageBox.information(
+            self,
+            "Student Registered",
+            f"Student registered successfully.\nStudent ID: {student_id}"
+        )
+
+    def selected_student_id(self):
+        row = self.students_table.currentRow()
+        if row < 0:
+            QMessageBox.information(
+                self,
+                "Select Student",
+                "Select a student row first."
+            )
+            return None
+        item = self.students_table.item(row, 0)
+        return item.text().strip() if item else None
+
+    def assign_nfc_card_dialog(self):
+        student_id = self.selected_student_id()
+        if not student_id:
+            return
+
+        existing = get_card_by_student(student_id)
+        if existing:
+            QMessageBox.information(
+                self,
+                "Card Already Assigned",
+                f"This student already has NFC card ID {existing['nfc_id']}."
+            )
+            return
+
+        card_uid, accepted = QInputDialog.getText(
+            self,
+            "Assign NFC Card",
+            f"Enter the new card UID for {student_id}:"
+        )
+        if not accepted:
+            return
+
+        card_uid = card_uid.strip()
+        if not card_uid:
+            QMessageBox.warning(
+                self,
+                "Missing Card UID",
+                "Enter a card UID to assign."
+            )
+            return
+
+        nfc_id = assign_card(student_id, card_uid)
+        if not nfc_id:
+            QMessageBox.warning(
+                self,
+                "Assignment Failed",
+                "The card could not be assigned. It may already be assigned to another student."
+            )
+            return
+
+        self.refresh_students()
+        QMessageBox.information(
+            self,
+            "Card Assigned",
+            f"NFC card assigned. Card ID: {nfc_id}"
+        )
+
+    def remove_nfc_card_dialog(self):
+        student_id = self.selected_student_id()
+        if not student_id:
+            return
+
+        existing = get_card_by_student(student_id)
+        if not existing:
+            QMessageBox.information(
+                self,
+                "No Card Assigned",
+                "This student does not have an NFC card assigned."
+            )
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Remove NFC Card",
+            f"Remove NFC card {existing['nfc_id']} from {student_id}? The student record will remain."
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        if not remove_card(student_id):
+            QMessageBox.warning(
+                self,
+                "Removal Failed",
+                "The NFC card could not be removed."
+            )
+            return
+
+        self.refresh_students()
+        QMessageBox.information(
+            self,
+            "Card Removed",
+            "The NFC card assignment was removed. The student record was preserved."
+        )
+
     def search_student_records(self, text):
         try:
             students = search_students(text)
@@ -1060,7 +1250,8 @@ class SmartGateWindow(QMainWindow):
                     student["full_name"],
                     student["department"],
                     student["year_level"],
-                    student["enrollment_status"]
+                    student["enrollment_status"],
+                    student["nfc_id"] or "Not assigned"
                 )
                 for student in students
             ]
