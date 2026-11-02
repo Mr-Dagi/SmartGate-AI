@@ -1,0 +1,14 @@
+.venv*/
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.env*
+!.env.example
+**/tempCodeRunnerFile.py
+logs/
+storage/student_faces/
+storage/qr_codes/
+SmartGate-AI/
