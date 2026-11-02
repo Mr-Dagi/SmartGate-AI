@@ -1300,6 +1300,8 @@ class SmartGateWindow(QMainWindow):
     def poll_api_for_nfc_job(self):
         if self.api_job_id or self.api_poll_worker and self.api_poll_worker.isRunning():
             return
+        if self.camera is not None or self.current_student is not None:
+            return
         if self.worker and self.worker.isRunning():
             return
 
@@ -1699,6 +1701,12 @@ class SmartGateWindow(QMainWindow):
         )
 
         self.worker = None
+        self.current_student = None
+        self.card_input.clear()
+        self.card_status.setText("Waiting for card...")
+        self.student_info.setText("Student information will appear here.")
+        self.capture_button.setEnabled(False)
+        self.start_camera_button.setEnabled(False)
 
     def closeEvent(self, event):
         self.dashboard_timer.stop()
