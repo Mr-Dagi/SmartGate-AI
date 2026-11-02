@@ -1,6 +1,7 @@
 
 import sys
 import cv2
+import requests
 
 from pathlib import Path
 
@@ -21,7 +22,13 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QMessageBox,
-    QAbstractItemView
+    QAbstractItemView,
+    QPlainTextEdit,
+    QDialog,
+    QFormLayout,
+    QSpinBox,
+    QInputDialog,
+    QDialogButtonBox
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -36,6 +43,10 @@ from database.db import (
     get_all_students,
     search_students,
     get_student_by_card,
+    get_card_by_student,
+    create_student,
+    assign_card,
+    remove_card,
     log_verification
 )
 
@@ -87,6 +98,49 @@ class VerificationWorker(QThread):
             )
 
 
+class ApiJobPollWorker(QThread):
+    job_received = Signal(object)
+
+    def run(self):
+        try:
+            response = requests.get(
+                "http://127.0.0.1:8000/desktop/next-job",
+                timeout=0.6
+            )
+            response.raise_for_status()
+            data = response.json()
+            job = data.get("job")
+            if job is None and data.get("job_id"):
+                job = data
+            self.job_received.emit(job if isinstance(job, dict) else None)
+        except (requests.RequestException, ValueError):
+            self.job_received.emit(None)
+
+
+class ChatWorker(QThread):
+    completed = Signal(bool, str)
+
+    def __init__(self, message, history):
+        super().__init__()
+        self.message = message
+        self.history = list(history)
+
+    def run(self):
+        try:
+            from api.services.ai_service import chat_with_ai
+
+            result = chat_with_ai(self.message, self.history)
+            self.completed.emit(
+                bool(result.get("success")),
+                str(result.get("reply", "The assistant returned no response."))
+            )
+        except Exception:
+            self.completed.emit(
+                False,
+                "The AI assistant is unavailable. Check that Ollama is running and the configured model is installed."
+            )
+
+
 class SmartGateWindow(QMainWindow):
 
     def __init__(self):
@@ -96,6 +150,10 @@ class SmartGateWindow(QMainWindow):
 
         self.current_student = None
         self.worker = None
+        self.chat_worker = None
+        self.chat_history = []
+        self.api_job_id = None
+        self.api_poll_worker = None
         self.nav_buttons = {}
 
         self.camera = None
@@ -246,6 +304,12 @@ class SmartGateWindow(QMainWindow):
         )
         self.dashboard_timer.start(3000)
 
+        # The desktop is the only process that opens the webcam.
+        # Phone NFC scans are queued by the API and picked up here.
+        self.api_poll_timer = QTimer(self)
+        self.api_poll_timer.timeout.connect(self.poll_api_for_nfc_job)
+        self.api_poll_timer.start(1200)
+
     def create_label(self, text, name=None):
         label = QLabel(text)
 
@@ -293,7 +357,8 @@ class SmartGateWindow(QMainWindow):
             ("Verification", 1),
             ("Students", 2),
             ("Activity Logs", 3),
-            ("Settings", 4)
+            ("Settings", 4),
+            ("AI Assistant", 5)
         ]
 
         for name, index in navigation:
@@ -323,6 +388,7 @@ class SmartGateWindow(QMainWindow):
         self.pages.addWidget(self.build_students_page())
         self.pages.addWidget(self.build_activity_page())
         self.pages.addWidget(self.build_settings_page())
+        self.pages.addWidget(self.build_ai_page())
 
         main_layout.addWidget(sidebar)
         main_layout.addWidget(self.pages, 1)
@@ -660,18 +726,34 @@ class SmartGateWindow(QMainWindow):
             "Full Name",
             "Department",
             "Year",
-            "Enrollment"
+            "Enrollment",
+            "NFC Card"
         ])
 
         panel_layout.addWidget(self.students_table)
 
         layout.addWidget(panel, 1)
 
+        actions = QHBoxLayout()
+
+        register_button = QPushButton("REGISTER STUDENT")
+        register_button.setObjectName("primary")
+        register_button.clicked.connect(self.register_student_dialog)
+
+        assign_button = QPushButton("ASSIGN NFC CARD")
+        assign_button.clicked.connect(self.assign_nfc_card_dialog)
+
+        remove_button = QPushButton("REMOVE NFC CARD")
+        remove_button.clicked.connect(self.remove_nfc_card_dialog)
+
         refresh_button = QPushButton("REFRESH STUDENTS")
-        refresh_button.setObjectName("primary")
         refresh_button.clicked.connect(self.refresh_students)
 
-        layout.addWidget(refresh_button)
+        actions.addWidget(register_button)
+        actions.addWidget(assign_button)
+        actions.addWidget(remove_button)
+        actions.addWidget(refresh_button)
+        layout.addLayout(actions)
 
         return page
 
@@ -744,6 +826,117 @@ class SmartGateWindow(QMainWindow):
         layout.addStretch()
 
         return page
+
+    def build_ai_page(self):
+        page, layout = self.build_page(
+            "AI Assistant",
+            "Ask about SmartGate features and troubleshooting. The assistant does not make identity or access decisions."
+        )
+
+        panel = self.create_panel()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(18, 18, 18, 18)
+        panel_layout.setSpacing(12)
+
+        self.chat_transcript = QPlainTextEdit()
+        self.chat_transcript.setReadOnly(True)
+        self.chat_transcript.setPlaceholderText(
+            "SmartGate AI assistant replies will appear here."
+        )
+        self.chat_transcript.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #0B1120;
+                border: 1px solid #26364F;
+                border-radius: 8px;
+                padding: 12px;
+                color: #E5E7EB;
+                font-size: 14px;
+            }
+        """)
+        panel_layout.addWidget(self.chat_transcript, 1)
+
+        input_row = QHBoxLayout()
+        self.chat_input = QLineEdit()
+        self.chat_input.setPlaceholderText(
+            "Ask a question about SmartGate AI..."
+        )
+        self.chat_input.returnPressed.connect(self.send_chat_message)
+
+        self.chat_send_button = QPushButton("SEND")
+        self.chat_send_button.setObjectName("primary")
+        self.chat_send_button.clicked.connect(self.send_chat_message)
+
+        input_row.addWidget(self.chat_input, 1)
+        input_row.addWidget(self.chat_send_button)
+        panel_layout.addLayout(input_row)
+
+        self.chat_status = self.create_label(
+            "Assistant uses the configured local Ollama model.",
+            "muted"
+        )
+        panel_layout.addWidget(self.chat_status)
+
+        clear_button = QPushButton("CLEAR CONVERSATION")
+        clear_button.clicked.connect(self.clear_chat)
+        panel_layout.addWidget(clear_button)
+
+        layout.addWidget(panel, 1)
+        return page
+
+    def send_chat_message(self):
+        message = self.chat_input.text().strip()
+        if not message:
+            return
+
+        if self.chat_worker and self.chat_worker.isRunning():
+            return
+
+        self.chat_transcript.appendPlainText(f"You: {message}")
+        self.chat_input.clear()
+        self.chat_input.setEnabled(False)
+        self.chat_send_button.setEnabled(False)
+        self.chat_status.setText("Thinking...")
+
+        history_for_request = list(self.chat_history)
+        self.chat_history.append({
+            "role": "user",
+            "content": message
+        })
+        self.chat_history = self.chat_history[-10:]
+
+        self.chat_worker = ChatWorker(message, history_for_request)
+        self.chat_worker.completed.connect(self.on_chat_completed)
+        self.chat_worker.start()
+
+    def on_chat_completed(self, success, reply):
+        label = "SmartGate AI" if success else "Assistant status"
+        self.chat_transcript.appendPlainText(f"{label}: {reply}")
+
+        if success and self.chat_history:
+            self.chat_history.append({
+                "role": "assistant",
+                "content": reply
+            })
+            self.chat_history = self.chat_history[-10:]
+
+        self.chat_status.setText(
+            "Ready" if success else
+            "Unavailable — check Ollama and the configured model."
+        )
+        self.chat_input.setEnabled(True)
+        self.chat_send_button.setEnabled(True)
+        self.chat_input.setFocus()
+
+        if self.chat_worker:
+            self.chat_worker.wait(100)
+            self.chat_worker = None
+
+    def clear_chat(self):
+        if self.chat_worker and self.chat_worker.isRunning():
+            return
+        self.chat_history.clear()
+        self.chat_transcript.clear()
+        self.chat_status.setText("Conversation cleared.")
 
     def create_table(self, headers):
         table = QTableWidget()
@@ -865,7 +1058,8 @@ class SmartGateWindow(QMainWindow):
                     student["full_name"],
                     student["department"],
                     student["year_level"],
-                    student["enrollment_status"]
+                    student["enrollment_status"],
+                    student["nfc_id"] or "Not assigned"
                 )
                 for student in students
             ]
@@ -882,6 +1076,170 @@ class SmartGateWindow(QMainWindow):
                 str(error)
             )
 
+    def register_student_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Register Student")
+        dialog.setMinimumWidth(430)
+
+        form = QFormLayout(dialog)
+        full_name = QLineEdit()
+        department = QLineEdit()
+        year_level = QSpinBox()
+        year_level.setRange(1, 10)
+        year_level.setValue(1)
+        university = QLineEdit("Unity University")
+        card_uid = QLineEdit()
+        card_uid.setPlaceholderText("Optional: card UID")
+
+        form.addRow("Full name", full_name)
+        form.addRow("Department", department)
+        form.addRow("Year level", year_level)
+        form.addRow("University", university)
+        form.addRow("NFC card UID (optional)", card_uid)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        name_value = full_name.text().strip()
+        department_value = department.text().strip()
+        university_value = university.text().strip() or "Unity University"
+
+        if not name_value or not department_value:
+            QMessageBox.warning(
+                self,
+                "Missing Information",
+                "Enter the student's full name and department."
+            )
+            return
+
+        student_id = create_student(
+            name_value,
+            department_value,
+            year_level.value(),
+            card_uid.text().strip() or None,
+            university_value
+        )
+
+        if not student_id:
+            QMessageBox.warning(
+                self,
+                "Registration Failed",
+                "The student could not be registered. Check whether the student or NFC card already exists."
+            )
+            return
+
+        self.refresh_students()
+        self.refresh_dashboard()
+        QMessageBox.information(
+            self,
+            "Student Registered",
+            f"Student registered successfully.\nStudent ID: {student_id}"
+        )
+
+    def selected_student_id(self):
+        row = self.students_table.currentRow()
+        if row < 0:
+            QMessageBox.information(
+                self,
+                "Select Student",
+                "Select a student row first."
+            )
+            return None
+        item = self.students_table.item(row, 0)
+        return item.text().strip() if item else None
+
+    def assign_nfc_card_dialog(self):
+        student_id = self.selected_student_id()
+        if not student_id:
+            return
+
+        existing = get_card_by_student(student_id)
+        if existing:
+            QMessageBox.information(
+                self,
+                "Card Already Assigned",
+                f"This student already has NFC card ID {existing['nfc_id']}."
+            )
+            return
+
+        card_uid, accepted = QInputDialog.getText(
+            self,
+            "Assign NFC Card",
+            f"Enter the new card UID for {student_id}:"
+        )
+        if not accepted:
+            return
+
+        card_uid = card_uid.strip()
+        if not card_uid:
+            QMessageBox.warning(
+                self,
+                "Missing Card UID",
+                "Enter a card UID to assign."
+            )
+            return
+
+        nfc_id = assign_card(student_id, card_uid)
+        if not nfc_id:
+            QMessageBox.warning(
+                self,
+                "Assignment Failed",
+                "The card could not be assigned. It may already be assigned to another student."
+            )
+            return
+
+        self.refresh_students()
+        QMessageBox.information(
+            self,
+            "Card Assigned",
+            f"NFC card assigned. Card ID: {nfc_id}"
+        )
+
+    def remove_nfc_card_dialog(self):
+        student_id = self.selected_student_id()
+        if not student_id:
+            return
+
+        existing = get_card_by_student(student_id)
+        if not existing:
+            QMessageBox.information(
+                self,
+                "No Card Assigned",
+                "This student does not have an NFC card assigned."
+            )
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Remove NFC Card",
+            f"Remove NFC card {existing['nfc_id']} from {student_id}? The student record will remain."
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        if not remove_card(student_id):
+            QMessageBox.warning(
+                self,
+                "Removal Failed",
+                "The NFC card could not be removed."
+            )
+            return
+
+        self.refresh_students()
+        QMessageBox.information(
+            self,
+            "Card Removed",
+            "The NFC card assignment was removed. The student record was preserved."
+        )
+
     def search_student_records(self, text):
         try:
             students = search_students(text)
@@ -892,7 +1250,8 @@ class SmartGateWindow(QMainWindow):
                     student["full_name"],
                     student["department"],
                     student["year_level"],
-                    student["enrollment_status"]
+                    student["enrollment_status"],
+                    student["nfc_id"] or "Not assigned"
                 )
                 for student in students
             ]
@@ -937,6 +1296,69 @@ class SmartGateWindow(QMainWindow):
                     "Activity Error",
                     str(error)
                 )
+
+    def poll_api_for_nfc_job(self):
+        if self.api_job_id or self.api_poll_worker and self.api_poll_worker.isRunning():
+            return
+        if self.camera is not None or self.current_student is not None:
+            return
+        if self.worker and self.worker.isRunning():
+            return
+
+        self.api_poll_worker = ApiJobPollWorker()
+        self.api_poll_worker.job_received.connect(self.on_api_job_received)
+        self.api_poll_worker.start()
+
+    def on_api_job_received(self, job):
+        if not job:
+            self.api_poll_worker = None
+            return
+
+        card_uid = str(job.get("card_uid", "")).strip()
+        job_id = str(job.get("job_id", "")).strip()
+        if not card_uid or not job_id:
+            self.api_poll_worker = None
+            return
+
+        self.api_job_id = job_id
+        self.card_input.setText(card_uid)
+        self.card_status.setText("NFC scan received from phone")
+        self.result_status.setText(
+            "Card scanned — preparing desktop face verification"
+        )
+        self.lookup_card()
+
+        if self.current_student:
+            self.start_camera()
+            self.camera_status.setText(
+                "Phone NFC scan received. Camera is ready; capture when the student is positioned."
+            )
+        else:
+            self.report_api_job_result(
+                "REVIEW",
+                "The desktop could not resolve the scanned card in its local database."
+            )
+
+        self.api_poll_worker = None
+
+    def report_api_job_result(self, result, message):
+        job_id = self.api_job_id
+        self.api_job_id = None
+        if not job_id:
+            return
+        try:
+            requests.post(
+                "http://127.0.0.1:8000/desktop/verification-result/"
+                + job_id,
+                json={"result": result, "message": message},
+                timeout=1.5
+            ).raise_for_status()
+        except requests.RequestException:
+            QMessageBox.warning(
+                self,
+                "API Connection",
+                "The local verification result was saved, but the phone status could not be updated. Check that the SmartGate API is running."
+            )
 
     def lookup_card(self):
         card_uid = self.card_input.text().strip()
@@ -1270,6 +1692,7 @@ class SmartGateWindow(QMainWindow):
         self.stop_camera_button.setEnabled(False)
 
         self.refresh_all()
+        self.report_api_job_result(result, message)
 
         QMessageBox.information(
             self,
@@ -1278,13 +1701,26 @@ class SmartGateWindow(QMainWindow):
         )
 
         self.worker = None
+        self.current_student = None
+        self.card_input.clear()
+        self.card_status.setText("Waiting for card...")
+        self.student_info.setText("Student information will appear here.")
+        self.capture_button.setEnabled(False)
+        self.start_camera_button.setEnabled(False)
 
     def closeEvent(self, event):
         self.dashboard_timer.stop()
+        self.api_poll_timer.stop()
         self.stop_camera()
 
         if self.worker and self.worker.isRunning():
             self.worker.wait()
+
+        if self.chat_worker and self.chat_worker.isRunning():
+            self.chat_worker.wait()
+
+        if self.api_poll_worker and self.api_poll_worker.isRunning():
+            self.api_poll_worker.wait(800)
 
         event.accept()
 

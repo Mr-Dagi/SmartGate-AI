@@ -1,10 +1,10 @@
 
 import logging
 from pathlib import Path
-from threading import Thread, Lock
+from threading import Lock
 from uuid import uuid4
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -14,8 +14,6 @@ from database.db import (
     log_verification
 )
 
-from camera.live_capture import capture_live_face
-from modules.face_verification import verify_face
 from api.services.ai_service import chat_with_ai
 
 
@@ -43,7 +41,6 @@ app = FastAPI(
 
 initialize_database()
 
-verification_lock = Lock()
 jobs_lock = Lock()
 verification_jobs = {}
 
@@ -66,87 +63,6 @@ def update_job(job_id, status, result=None, message=None):
         }
 
 
-def run_face_verification(job_id, student_id, card_uid):
-    acquired = verification_lock.acquire(blocking=False)
-
-    if not acquired:
-        update_job(
-            job_id,
-            "completed",
-            "REVIEW",
-            "Another verification is already running."
-        )
-        return
-
-    result = "REVIEW"
-    reason = "Verification could not be completed."
-
-    try:
-        update_job(
-            job_id,
-            "processing",
-            message="Starting automatic face capture."
-        )
-
-        if not capture_live_face():
-            reason = "Automatic face capture unsuccessful."
-        elif not LIVE_IMAGE.exists():
-            reason = "Captured image was not found."
-        else:
-            result = verify_face(student_id, LIVE_IMAGE)
-
-            if result == "MATCH":
-                reason = "Face comparison returned MATCH."
-            elif result == "MISMATCH":
-                reason = "Face comparison returned MISMATCH."
-            else:
-                result = "REVIEW"
-                reason = "Face comparison requires manual review."
-
-        log_verification(
-            student_id,
-            card_uid,
-            result,
-            reason
-        )
-
-        update_job(
-            job_id,
-            "completed",
-            result,
-            reason
-        )
-
-        logger.info(
-            "Verification completed: student=%s result=%s",
-            student_id,
-            result
-        )
-
-    except Exception:
-        logger.exception("Verification failed for job %s", job_id)
-
-        try:
-            log_verification(
-                student_id,
-                card_uid,
-                "REVIEW",
-                "Unexpected verification error."
-            )
-        except Exception:
-            logger.exception("Could not save verification event.")
-
-        update_job(
-            job_id,
-            "completed",
-            "REVIEW",
-            "Unexpected error. Manual review required."
-        )
-
-    finally:
-        verification_lock.release()
-
-
 @app.get("/")
 def home():
     return {
@@ -160,7 +76,8 @@ def home():
 def health():
     return {
         "status": "healthy",
-        "camera_busy": verification_lock.locked()
+        "verification_jobs": len(verification_jobs),
+        "camera_owner": "desktop"
     }
 
 
@@ -212,27 +129,22 @@ def start_verification(data: CardScan):
             "message": "Unknown card."
         }
 
-    if verification_lock.locked():
-        return {
-            "success": False,
-            "message": "Another verification is already running."
-        }
-
     job_id = str(uuid4())
 
-    update_job(
-        job_id,
-        "processing",
-        message="Verification queued."
-    )
-
-    worker = Thread(
-        target=run_face_verification,
-        args=(job_id, student["student_id"], card_uid),
-        daemon=True
-    )
-
-    worker.start()
+    with jobs_lock:
+        verification_jobs[job_id] = {
+            "status": "queued",
+            "result": None,
+            "message": "Card scanned. Waiting for the desktop verification station.",
+            "student_id": student["student_id"],
+            "card_uid": card_uid,
+            "student": {
+                "student_id": student["student_id"],
+                "full_name": student["full_name"],
+                "department": student["department"],
+                "year_level": student["year_level"]
+            }
+        }
 
     return {
         "success": True,
@@ -241,8 +153,62 @@ def start_verification(data: CardScan):
             "student_id": student["student_id"],
             "full_name": student["full_name"]
         },
-        "message": "Automatic face verification started."
+        "message": "Card accepted. Waiting for the desktop station to capture and compare the face."
     }
+
+
+@app.get("/desktop/next-job")
+def desktop_next_job(request: Request):
+    """Return one queued NFC job to the desktop app, which owns the camera."""
+    if request.client is None or request.client.host not in {"127.0.0.1", "::1"}:
+        return {"success": False, "message": "Desktop polling is only allowed locally."}
+
+    with jobs_lock:
+        for job_id, job in verification_jobs.items():
+            if job["status"] == "queued":
+                job["status"] = "assigned"
+                job["message"] = "Desktop station received the card scan."
+                return {
+                    "success": True,
+                    "job_id": job_id,
+                    "card_uid": job["card_uid"],
+                    "student": job["student"]
+                }
+
+    return {"success": True, "job": None}
+
+
+class DesktopVerificationResult(BaseModel):
+    result: str = Field(pattern="^(MATCH|MISMATCH|REVIEW)$")
+    message: str = Field(default="Face comparison completed.", max_length=500)
+
+
+@app.post("/desktop/verification-result/{job_id}")
+def desktop_verification_result(
+    job_id: str,
+    data: DesktopVerificationResult,
+    request: Request
+):
+    if request.client is None or request.client.host not in {"127.0.0.1", "::1"}:
+        return {"success": False, "message": "Desktop result updates are only allowed locally."}
+
+    with jobs_lock:
+        job = verification_jobs.get(job_id)
+        if not job:
+            return {"success": False, "message": "Verification job not found."}
+        if job["status"] == "completed":
+            return {"success": False, "message": "Verification job is already completed."}
+        job["status"] = "completed"
+        job["result"] = data.result
+        job["message"] = data.message
+
+    logger.info(
+        "Desktop verification completed: job=%s student=%s result=%s",
+        job_id,
+        job.get("student_id"),
+        data.result
+    )
+    return {"success": True, "status": "completed", "result": data.result}
 
 
 @app.get("/verification-status/{job_id}")
@@ -435,10 +401,10 @@ def phone_scan():
                         return;
                     }
 
-                    if (data.status === "processing") {
+                    if (["queued", "assigned", "processing"].includes(data.status)) {
                         showMessage(
                             data.message ||
-                            "Waiting for automatic face verification..."
+                            "Waiting for the desktop face verification station..."
                         );
 
                         pollingTimer = setTimeout(
