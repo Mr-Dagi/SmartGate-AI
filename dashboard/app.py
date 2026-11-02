@@ -1,6 +1,7 @@
 
 import sys
 import cv2
+import requests
 
 from pathlib import Path
 
@@ -88,6 +89,25 @@ class VerificationWorker(QThread):
             )
 
 
+class ApiJobPollWorker(QThread):
+    job_received = Signal(object)
+
+    def run(self):
+        try:
+            response = requests.get(
+                "http://127.0.0.1:8000/desktop/next-job",
+                timeout=0.6
+            )
+            response.raise_for_status()
+            data = response.json()
+            job = data.get("job")
+            if job is None and data.get("job_id"):
+                job = data
+            self.job_received.emit(job if isinstance(job, dict) else None)
+        except (requests.RequestException, ValueError):
+            self.job_received.emit(None)
+
+
 class ChatWorker(QThread):
     completed = Signal(bool, str)
 
@@ -123,6 +143,8 @@ class SmartGateWindow(QMainWindow):
         self.worker = None
         self.chat_worker = None
         self.chat_history = []
+        self.api_job_id = None
+        self.api_poll_worker = None
         self.nav_buttons = {}
 
         self.camera = None
@@ -272,6 +294,12 @@ class SmartGateWindow(QMainWindow):
             self.refresh_live_data
         )
         self.dashboard_timer.start(3000)
+
+        # The desktop is the only process that opens the webcam.
+        # Phone NFC scans are queued by the API and picked up here.
+        self.api_poll_timer = QTimer(self)
+        self.api_poll_timer.timeout.connect(self.poll_api_for_nfc_job)
+        self.api_poll_timer.start(1200)
 
     def create_label(self, text, name=None):
         label = QLabel(text)
@@ -1078,6 +1106,67 @@ class SmartGateWindow(QMainWindow):
                     str(error)
                 )
 
+    def poll_api_for_nfc_job(self):
+        if self.api_job_id or self.api_poll_worker and self.api_poll_worker.isRunning():
+            return
+        if self.worker and self.worker.isRunning():
+            return
+
+        self.api_poll_worker = ApiJobPollWorker()
+        self.api_poll_worker.job_received.connect(self.on_api_job_received)
+        self.api_poll_worker.start()
+
+    def on_api_job_received(self, job):
+        if not job:
+            self.api_poll_worker = None
+            return
+
+        card_uid = str(job.get("card_uid", "")).strip()
+        job_id = str(job.get("job_id", "")).strip()
+        if not card_uid or not job_id:
+            self.api_poll_worker = None
+            return
+
+        self.api_job_id = job_id
+        self.card_input.setText(card_uid)
+        self.card_status.setText("NFC scan received from phone")
+        self.result_status.setText(
+            "Card scanned — preparing desktop face verification"
+        )
+        self.lookup_card()
+
+        if self.current_student:
+            self.start_camera()
+            self.camera_status.setText(
+                "Phone NFC scan received. Camera is ready; capture when the student is positioned."
+            )
+        else:
+            self.report_api_job_result(
+                "REVIEW",
+                "The desktop could not resolve the scanned card in its local database."
+            )
+
+        self.api_poll_worker = None
+
+    def report_api_job_result(self, result, message):
+        job_id = self.api_job_id
+        self.api_job_id = None
+        if not job_id:
+            return
+        try:
+            requests.post(
+                "http://127.0.0.1:8000/desktop/verification-result/"
+                + job_id,
+                json={"result": result, "message": message},
+                timeout=1.5
+            ).raise_for_status()
+        except requests.RequestException:
+            QMessageBox.warning(
+                self,
+                "API Connection",
+                "The local verification result was saved, but the phone status could not be updated. Check that the SmartGate API is running."
+            )
+
     def lookup_card(self):
         card_uid = self.card_input.text().strip()
 
@@ -1410,6 +1499,7 @@ class SmartGateWindow(QMainWindow):
         self.stop_camera_button.setEnabled(False)
 
         self.refresh_all()
+        self.report_api_job_result(result, message)
 
         QMessageBox.information(
             self,
@@ -1421,6 +1511,7 @@ class SmartGateWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.dashboard_timer.stop()
+        self.api_poll_timer.stop()
         self.stop_camera()
 
         if self.worker and self.worker.isRunning():
@@ -1428,6 +1519,9 @@ class SmartGateWindow(QMainWindow):
 
         if self.chat_worker and self.chat_worker.isRunning():
             self.chat_worker.wait()
+
+        if self.api_poll_worker and self.api_poll_worker.isRunning():
+            self.api_poll_worker.wait(800)
 
         event.accept()
 
