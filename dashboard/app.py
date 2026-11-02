@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QMessageBox,
-    QAbstractItemView
+    QAbstractItemView,
+    QPlainTextEdit
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -87,6 +88,30 @@ class VerificationWorker(QThread):
             )
 
 
+class ChatWorker(QThread):
+    completed = Signal(bool, str)
+
+    def __init__(self, message, history):
+        super().__init__()
+        self.message = message
+        self.history = list(history)
+
+    def run(self):
+        try:
+            from api.services.ai_service import chat_with_ai
+
+            result = chat_with_ai(self.message, self.history)
+            self.completed.emit(
+                bool(result.get("success")),
+                str(result.get("reply", "The assistant returned no response."))
+            )
+        except Exception:
+            self.completed.emit(
+                False,
+                "The AI assistant is unavailable. Check that Ollama is running and the configured model is installed."
+            )
+
+
 class SmartGateWindow(QMainWindow):
 
     def __init__(self):
@@ -96,6 +121,8 @@ class SmartGateWindow(QMainWindow):
 
         self.current_student = None
         self.worker = None
+        self.chat_worker = None
+        self.chat_history = []
         self.nav_buttons = {}
 
         self.camera = None
@@ -293,7 +320,8 @@ class SmartGateWindow(QMainWindow):
             ("Verification", 1),
             ("Students", 2),
             ("Activity Logs", 3),
-            ("Settings", 4)
+            ("Settings", 4),
+            ("AI Assistant", 5)
         ]
 
         for name, index in navigation:
@@ -323,6 +351,7 @@ class SmartGateWindow(QMainWindow):
         self.pages.addWidget(self.build_students_page())
         self.pages.addWidget(self.build_activity_page())
         self.pages.addWidget(self.build_settings_page())
+        self.pages.addWidget(self.build_ai_page())
 
         main_layout.addWidget(sidebar)
         main_layout.addWidget(self.pages, 1)
@@ -744,6 +773,117 @@ class SmartGateWindow(QMainWindow):
         layout.addStretch()
 
         return page
+
+    def build_ai_page(self):
+        page, layout = self.build_page(
+            "AI Assistant",
+            "Ask about SmartGate features and troubleshooting. The assistant does not make identity or access decisions."
+        )
+
+        panel = self.create_panel()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(18, 18, 18, 18)
+        panel_layout.setSpacing(12)
+
+        self.chat_transcript = QPlainTextEdit()
+        self.chat_transcript.setReadOnly(True)
+        self.chat_transcript.setPlaceholderText(
+            "SmartGate AI assistant replies will appear here."
+        )
+        self.chat_transcript.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #0B1120;
+                border: 1px solid #26364F;
+                border-radius: 8px;
+                padding: 12px;
+                color: #E5E7EB;
+                font-size: 14px;
+            }
+        """)
+        panel_layout.addWidget(self.chat_transcript, 1)
+
+        input_row = QHBoxLayout()
+        self.chat_input = QLineEdit()
+        self.chat_input.setPlaceholderText(
+            "Ask a question about SmartGate AI..."
+        )
+        self.chat_input.returnPressed.connect(self.send_chat_message)
+
+        self.chat_send_button = QPushButton("SEND")
+        self.chat_send_button.setObjectName("primary")
+        self.chat_send_button.clicked.connect(self.send_chat_message)
+
+        input_row.addWidget(self.chat_input, 1)
+        input_row.addWidget(self.chat_send_button)
+        panel_layout.addLayout(input_row)
+
+        self.chat_status = self.create_label(
+            "Assistant uses the configured local Ollama model.",
+            "muted"
+        )
+        panel_layout.addWidget(self.chat_status)
+
+        clear_button = QPushButton("CLEAR CONVERSATION")
+        clear_button.clicked.connect(self.clear_chat)
+        panel_layout.addWidget(clear_button)
+
+        layout.addWidget(panel, 1)
+        return page
+
+    def send_chat_message(self):
+        message = self.chat_input.text().strip()
+        if not message:
+            return
+
+        if self.chat_worker and self.chat_worker.isRunning():
+            return
+
+        self.chat_transcript.appendPlainText(f"You: {message}")
+        self.chat_input.clear()
+        self.chat_input.setEnabled(False)
+        self.chat_send_button.setEnabled(False)
+        self.chat_status.setText("Thinking...")
+
+        history_for_request = list(self.chat_history)
+        self.chat_history.append({
+            "role": "user",
+            "content": message
+        })
+        self.chat_history = self.chat_history[-10:]
+
+        self.chat_worker = ChatWorker(message, history_for_request)
+        self.chat_worker.completed.connect(self.on_chat_completed)
+        self.chat_worker.start()
+
+    def on_chat_completed(self, success, reply):
+        label = "SmartGate AI" if success else "Assistant status"
+        self.chat_transcript.appendPlainText(f"{label}: {reply}")
+
+        if success and self.chat_history:
+            self.chat_history.append({
+                "role": "assistant",
+                "content": reply
+            })
+            self.chat_history = self.chat_history[-10:]
+
+        self.chat_status.setText(
+            "Ready" if success else
+            "Unavailable — check Ollama and the configured model."
+        )
+        self.chat_input.setEnabled(True)
+        self.chat_send_button.setEnabled(True)
+        self.chat_input.setFocus()
+
+        if self.chat_worker:
+            self.chat_worker.wait(100)
+            self.chat_worker = None
+
+    def clear_chat(self):
+        if self.chat_worker and self.chat_worker.isRunning():
+            return
+        self.chat_history.clear()
+        self.chat_transcript.clear()
+        self.chat_status.setText("Conversation cleared.")
 
     def create_table(self, headers):
         table = QTableWidget()
@@ -1285,6 +1425,9 @@ class SmartGateWindow(QMainWindow):
 
         if self.worker and self.worker.isRunning():
             self.worker.wait()
+
+        if self.chat_worker and self.chat_worker.isRunning():
+            self.chat_worker.wait()
 
         event.accept()
 
