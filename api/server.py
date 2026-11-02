@@ -4,7 +4,7 @@ from pathlib import Path
 from threading import Lock
 from uuid import uuid4
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -158,8 +158,11 @@ def start_verification(data: CardScan):
 
 
 @app.get("/desktop/next-job")
-def desktop_next_job():
+def desktop_next_job(request: Request):
     """Return one queued NFC job to the desktop app, which owns the camera."""
+    if request.client is None or request.client.host not in {"127.0.0.1", "::1"}:
+        return {"success": False, "message": "Desktop polling is only allowed locally."}
+
     with jobs_lock:
         for job_id, job in verification_jobs.items():
             if job["status"] == "queued":
@@ -181,7 +184,14 @@ class DesktopVerificationResult(BaseModel):
 
 
 @app.post("/desktop/verification-result/{job_id}")
-def desktop_verification_result(job_id: str, data: DesktopVerificationResult):
+def desktop_verification_result(
+    job_id: str,
+    data: DesktopVerificationResult,
+    request: Request
+):
+    if request.client is None or request.client.host not in {"127.0.0.1", "::1"}:
+        return {"success": False, "message": "Desktop result updates are only allowed locally."}
+
     with jobs_lock:
         job = verification_jobs.get(job_id)
         if not job:
@@ -391,10 +401,10 @@ def phone_scan():
                         return;
                     }
 
-                    if (data.status === "processing") {
+                    if (["queued", "assigned", "processing"].includes(data.status)) {
                         showMessage(
                             data.message ||
-                            "Waiting for automatic face verification..."
+                            "Waiting for the desktop face verification station..."
                         );
 
                         pollingTimer = setTimeout(
